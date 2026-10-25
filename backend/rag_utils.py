@@ -1,16 +1,88 @@
 
 from langchain_openai import ChatOpenAI
+from rank_bm25 import BM25Okapi
 import os
+import re
 
-# Retrieve the top-k relevant chunks from the vector store
-def retrieve(query: str, k: int = 2,vectorstore=None) -> list[str]:
-    results = vectorstore.similarity_search(query, k=k)
+# Hybrid retrieval: dense similarity (FAISS) fused with keyword search (BM25), plus property boost and de-duplication
+def keyword_tokens(text: str) -> list[str]:
+    """Lower-cased alphanumeric tokens for BM25 (so 'ASH-SEA' becomes ['ash', 'sea'])."""
+    return re.findall(r"[a-z0-9]+", text.lower())
 
-    # Return each chunk with its content and metadata
-    return [
-        f"Content:\n{r.page_content}\n\nMetadata:\n{r.metadata}"
-        for r in results
-    ]
+
+class HybridRetriever:
+    """
+    Combines two rankings of the same chunk collection and fuses them with Reciprocal Rank Fusion (RRF):
+
+    - dense ranking: FAISS similarity on the embedding model (captures meaning; weak on codes and names)
+    - keyword ranking: BM25 over the chunk text (captures exact tokens such as property codes and city names)
+
+    Two refinements address problems observed with dense-only retrieval on these documents:
+    - property boost: if the question mentions a property (code, name or city, discovered automatically from
+      the property matrices), chunks naming that property get a bonus so its row outranks other properties' rows;
+    - de-duplication: the property matrices are repeated in three documents, so identical chunk bodies are
+      returned only once, leaving room for other relevant chunks.
+    """
+
+    def __init__(self, vectorstore, candidates: int = 20, rrf_k: int = 60, property_boost: float = 0.05):
+        self.vectorstore = vectorstore
+        self.docs = list(vectorstore.docstore._dict.values())
+        self.bm25 = BM25Okapi([keyword_tokens(d.page_content) for d in self.docs])
+        self.candidates, self.rrf_k, self.property_boost = candidates, rrf_k, property_boost
+
+        # Property aliases discovered from the matrices, e.g. "ASH-MIA Brickell, Miami FL" -> {ash-mia, mia, brickell, miami}
+        text = "\n".join(d.page_content for d in self.docs)
+        self.properties = {}
+        for code, name, city in set(re.findall(r"(ASH-[A-Z]{3}) ([A-Z][a-zA-Z]+), ([A-Z][a-zA-Z]+)", text)):
+            self.properties[code] = {code.lower(), code.split("-")[1].lower(), name.lower(), city.lower()}
+
+    def mentioned_properties(self, query: str) -> list[str]:
+        q = set(keyword_tokens(query)) | {m.lower() for m in re.findall(r"ASH-[A-Z]{3}", query)}
+        return [code for code, aliases in self.properties.items() if aliases & q]
+
+    def retrieve(self, query: str, k: int):
+        # 1. Two candidate rankings
+        dense = self.vectorstore.similarity_search(query, k=self.candidates)
+        scores = self.bm25.get_scores(keyword_tokens(query))
+        top = sorted(range(len(self.docs)), key=lambda i: -scores[i])[:self.candidates]
+        keyword = [self.docs[i] for i in top if scores[i] > 0]
+
+        # 2. Reciprocal Rank Fusion of the two rankings
+        fused = {}
+        for ranking in (dense, keyword):
+            for rank, d in enumerate(ranking):
+                fused[d.page_content] = fused.get(d.page_content, 0.0) + 1.0 / (self.rrf_k + rank + 1)
+
+        # 3. Property boost
+        for code in self.mentioned_properties(query):
+            for content in fused:
+                if code in content:
+                    fused[content] += self.property_boost
+
+        # 4. Top-k with de-duplication of identical chunk bodies (the text after the "title | section" line)
+        by_content = {d.page_content: d for d in dense + keyword}
+        results, seen = [], set()
+        for content in sorted(fused, key=lambda c: -fused[c]):
+            body = content.split("\n", 1)[-1].strip()
+            if body in seen:
+                continue
+            seen.add(body)
+            results.append(by_content[content])
+            if len(results) == k:
+                break
+        return results
+
+
+# One hybrid retriever per vector store (the BM25 index is built once and reused)
+_hybrid_cache = {}
+
+def retrieve(query: str, k: int = 2, vectorstore=None) -> list[str]:
+    """Retrieve the top-k relevant chunks (hybrid dense + keyword search, as developed in the notebook)."""
+    if id(vectorstore) not in _hybrid_cache:
+        _hybrid_cache[id(vectorstore)] = HybridRetriever(vectorstore)
+    results = _hybrid_cache[id(vectorstore)].retrieve(query, k)
+    return [f"Content:\n{r.page_content}\n\nMetadata:\n{r.metadata}" for r in results]
+
 
 # Define the generation function that prompts the LLM with retrieved context
 def generate(query, retrieved_chunks, model) -> str:
